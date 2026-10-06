@@ -7,7 +7,8 @@ from app.models import (
     StaffType, SessionType, SessionStatus,
     AssignmentRole, AudienceType, WarningType,
     ChangeType, ChangeStatus, ConflictType, RescheduleStatus,
-    PointSourceType
+    PointSourceType, VersionStatus, ErrataSeverity, ErrataStatus,
+    FreezeScheduleState, SchoolResponse, ErrataAckStatus,
 )
 
 
@@ -639,3 +640,235 @@ class StaffPointDetail(StaffRankingItem):
     is_excellent: bool
     positive_review_rate: float
     monthly_points: int = 0
+
+
+# ============ 讲解词版本、冻结清单与勘误 ============
+
+
+class ContentSectionBase(BaseModel):
+    title: str
+    body: str
+    is_required: bool = True
+
+
+class ContentSectionCreate(ContentSectionBase):
+    section_no: Optional[int] = None
+
+
+class ContentSection(ContentSectionBase):
+    id: int
+    section_no: int
+
+    class Config:
+        from_attributes = True
+
+
+class ContentVersionBase(BaseModel):
+    min_age: int = Field(ge=0, le=120)
+    max_age: int = Field(ge=0, le=120)
+    effective_from: datetime
+    effective_to: datetime
+    change_note: Optional[str] = None
+
+
+class ContentVersionCreate(ContentVersionBase):
+    sections: List[ContentSectionCreate]
+    created_by: Optional[str] = None
+
+
+class ContentVersionDraftUpdate(BaseModel):
+    """更新草稿（已发布/已撤回版本不可修改，保证证据不可变）"""
+    min_age: Optional[int] = Field(None, ge=0, le=120)
+    max_age: Optional[int] = Field(None, ge=0, le=120)
+    effective_from: Optional[datetime] = None
+    effective_to: Optional[datetime] = None
+    change_note: Optional[str] = None
+    sections: Optional[List[ContentSectionCreate]] = None
+
+
+class ContentVersionPublish(BaseModel):
+    operator: str
+
+
+class ContentVersionWithdraw(BaseModel):
+    operator: str
+    reason: str
+
+
+class ContentVersionSummary(BaseModel):
+    id: int
+    theme_id: int
+    theme_name: str
+    version_no: int
+    status: VersionStatus
+    min_age: int
+    max_age: int
+    effective_from: datetime
+    effective_to: datetime
+    content_hash: Optional[str] = None
+    change_note: Optional[str] = None
+    created_by: Optional[str] = None
+    published_by: Optional[str] = None
+    published_at: Optional[datetime] = None
+    withdrawn_by: Optional[str] = None
+    withdraw_reason: Optional[str] = None
+    withdrawn_at: Optional[datetime] = None
+    section_count: int = 0
+    required_section_count: int = 0
+    active_errata_count: int = 0
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ContentVersionDetail(ContentVersionSummary):
+    sections: List[ContentSection] = []
+
+
+class ErratumCreate(BaseModel):
+    section_id: Optional[int] = None
+    title: str
+    old_text: Optional[str] = None
+    new_text: str
+    reason: Optional[str] = None
+    severity: ErrataSeverity = ErrataSeverity.NORMAL
+    issued_by: Optional[str] = None
+
+
+class Erratum(BaseModel):
+    id: int
+    theme_version_id: int
+    erratum_no: int
+    section_id: Optional[int] = None
+    section_title: Optional[str] = None
+    title: str
+    old_text: Optional[str] = None
+    new_text: str
+    reason: Optional[str] = None
+    severity: ErrataSeverity
+    status: ErrataStatus
+    supersedes_id: Optional[int] = None
+    issued_by: Optional[str] = None
+    issued_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class FreezeCreate(BaseModel):
+    """场次确认：冻结当时发布版本的内容清单"""
+    audience_age: Optional[int] = Field(None, ge=0, le=120)
+    confirmed_by: Optional[str] = None
+
+
+class RescheduleRequest(BaseModel):
+    """场次改期申请：进入"改期待审核"，审核通过后才改变场次时间"""
+    new_start_time: datetime
+    new_end_time: datetime
+    reason: Optional[str] = None
+    requester: str
+
+
+class RescheduleReview(BaseModel):
+    approved: bool
+    reviewer: str
+    comment: Optional[str] = None
+
+
+class NewVersionDecision(BaseModel):
+    """学校对新版本的回应：接受则冻结新版本，拒绝则保留原冻结"""
+    accepted: bool
+    responder: str
+    note: Optional[str] = None
+
+
+class ErrataDecision(BaseModel):
+    """场次对勘误的回应"""
+    apply: bool
+    responder: str
+    note: Optional[str] = None
+
+
+class FreezeSectionItem(BaseModel):
+    section_no: int
+    title: str
+    body: str
+    is_required: bool
+    # 该段落叠加的勘误（按勘误链排序，最后一条生效勘误为准）
+    erratas: List[Erratum] = []
+
+
+class ErrataAckItem(BaseModel):
+    id: int
+    erratum_id: int
+    erratum_title: str
+    severity: ErrataSeverity
+    status: ErrataAckStatus
+    decided_by: Optional[str] = None
+    decided_at: Optional[datetime] = None
+    note: Optional[str] = None
+    created_at: datetime
+
+
+class SessionFreeze(BaseModel):
+    id: int
+    session_id: int
+    session_title: str
+    theme_id: int
+    theme_name: str
+    theme_version_id: int
+    version_no: int
+    audience_age: Optional[int] = None
+    is_current: bool
+    content_hash: str
+    schedule_state: FreezeScheduleState
+    school_confirmed: bool
+    confirmed_by: Optional[str] = None
+    frozen_at: datetime
+    target_version_id: Optional[int] = None
+    target_version_no: Optional[int] = None
+    school_response: SchoolResponse
+    responded_at: Optional[datetime] = None
+    response_note: Optional[str] = None
+    pending_start_time: Optional[datetime] = None
+    pending_end_time: Optional[datetime] = None
+    reschedule_reason: Optional[str] = None
+    requested_by: Optional[str] = None
+    reschedule_reviewed_by: Optional[str] = None
+    reschedule_reviewed_at: Optional[datetime] = None
+    snapshot: Optional[dict] = None
+    sections: List[FreezeSectionItem] = []
+    erratum_acks: List[ErrataAckItem] = []
+
+
+class FreezeReplay(BaseModel):
+    """按场次还原：冻结清单 + 后续勘误链"""
+    freeze: SessionFreeze
+    errata_chain: List[Erratum] = []
+    pending_erratas: List[Erratum] = []
+    effective_sections: List[FreezeSectionItem] = []
+
+
+class StaffReplacementCreate(BaseModel):
+    new_staff_id: int
+    old_staff_id: Optional[int] = None
+    reason: Optional[str] = None
+    operator: str
+
+
+class StaffReplacementRecord(BaseModel):
+    id: int
+    session_id: int
+    old_staff_id: int
+    old_staff_name: str
+    new_staff_id: int
+    new_staff_name: str
+    old_assignment_id: Optional[int] = None
+    role: AssignmentRole
+    reason: Optional[str] = None
+    operator: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True

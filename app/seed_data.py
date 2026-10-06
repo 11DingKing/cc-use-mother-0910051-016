@@ -7,9 +7,11 @@ from app.database import engine, SessionLocal, Base
 from app.models import (
     Staff, Theme, Venue, StaffTheme, StaffVenue, School,
     Session, Assignment, Review, LevelBadge,
+    ContentVersion, ContentSection, VersionStatus,
     StaffType, SessionType, SessionStatus, AssignmentRole, AudienceType
 )
 from app.crud import is_session_fully_staffed
+from app.crud_content import _compute_version_hash
 
 
 def seed_database():
@@ -36,6 +38,40 @@ def seed_database():
             db.add(theme)
             themes.append(theme)
         db.flush()
+
+        # 每个主题发布一版讲解词（含适用年龄、必讲段落、生效区间）
+        published_count = 0
+        for theme in themes:
+            version = ContentVersion(
+                theme_id=theme.id,
+                version_no=1,
+                status=VersionStatus.PUBLISHED,
+                min_age=6,
+                max_age=18,
+                effective_from=datetime(2026, 1, 1),
+                effective_to=datetime(2027, 12, 31, 23, 59, 59),
+                change_note="遗产日首版讲解词",
+                created_by="内容组",
+                published_by="内容组",
+                published_at=datetime(2026, 1, 1),
+            )
+            version.sections = [
+                ContentSection(section_no=1, title="开篇导览",
+                               body=f"欢迎来到{theme.name}主题讲解。",
+                               is_required=True),
+                ContentSection(section_no=2, title="重点内容",
+                               body=f"{theme.description}，请同学们重点体会。",
+                               is_required=True),
+                ContentSection(section_no=3, title="拓展与互动",
+                               body="选讲：结合展品自由提问与讨论。",
+                               is_required=False),
+            ]
+            db.add(version)
+            db.flush()
+            version.content_hash = _compute_version_hash(version)
+            published_count += 1
+        db.flush()
+        print(f"  讲解词版本: {published_count} 个已发布版本")
 
         venues_data = [
             {"name": "一号展厅", "venue_type": "展厅", "capacity": 100, "location": "A馆一层"},

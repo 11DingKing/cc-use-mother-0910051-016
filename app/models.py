@@ -393,3 +393,197 @@ class StaffBadge(Base):
 
     staff = relationship("Staff", back_populates="badges")
     level_badge = relationship("LevelBadge")
+
+
+class VersionStatus(str, enum.Enum):
+    DRAFT = "草稿"
+    PUBLISHED = "已发布"
+    WITHDRAWN = "已撤回"
+
+
+class ErrataSeverity(str, enum.Enum):
+    LOW = "文字微调"
+    NORMAL = "常规勘误"
+    CRITICAL = "紧急勘误"
+
+
+class ErrataStatus(str, enum.Enum):
+    ACTIVE = "生效中"
+    SUPERSEDED = "已被取代"
+
+
+class FreezeScheduleState(str, enum.Enum):
+    CONFIRMED = "已确认"
+    RESCHEDULED_PENDING = "改期待审核"
+    VERSION_WITHDRAWN_PENDING = "版本撤回待重新确认"
+    UPDATE_PENDING = "新版本待确认"
+    UPDATE_DECLINED = "学校拒绝新版本"
+    ERRATA_PENDING = "勘误待回应"
+    COMPLETED_LOCKED = "已结束证据锁定"
+
+
+class SchoolResponse(str, enum.Enum):
+    PENDING = "待回应"
+    ACCEPTED = "接受"
+    DECLINED = "拒绝"
+
+
+class ErrataAckStatus(str, enum.Enum):
+    PENDING = "待回应"
+    APPLIED = "已应用"
+    DECLINED = "已拒绝"
+    IRRELEVANT = "不适用"
+
+
+class ContentVersion(Base):
+    """主题讲解词版本：以发布形式存在，带适用年龄、必讲段落和生效区间"""
+    __tablename__ = "content_versions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    theme_id = Column(Integer, ForeignKey("themes.id"), nullable=False)
+    version_no = Column(Integer, nullable=False)
+    status = Column(Enum(VersionStatus), nullable=False, default=VersionStatus.DRAFT)
+    min_age = Column(Integer, nullable=False)
+    max_age = Column(Integer, nullable=False)
+    effective_from = Column(DateTime(timezone=True), nullable=False)
+    effective_to = Column(DateTime(timezone=True), nullable=False)
+    content_hash = Column(String(64))
+    change_note = Column(Text)
+    created_by = Column(String(100))
+    published_by = Column(String(100))
+    published_at = Column(DateTime(timezone=True))
+    withdrawn_by = Column(String(100))
+    withdraw_reason = Column(Text)
+    withdrawn_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    theme = relationship("Theme")
+    sections = relationship("ContentSection", back_populates="version",
+                            cascade="all, delete-orphan",
+                            order_by="ContentSection.section_no")
+    erratas = relationship("ContentErratum", back_populates="version",
+                           cascade="all, delete-orphan",
+                           order_by="ContentErratum.erratum_no")
+    freezes = relationship("SessionContentFreeze", back_populates="content_version",
+                           foreign_keys="SessionContentFreeze.theme_version_id")
+
+
+class ContentSection(Base):
+    """版本内的讲解段落，is_required 标记必讲段落"""
+    __tablename__ = "content_sections"
+
+    id = Column(Integer, primary_key=True, index=True)
+    version_id = Column(Integer, ForeignKey("content_versions.id"), nullable=False)
+    section_no = Column(Integer, nullable=False)
+    title = Column(String(200), nullable=False)
+    body = Column(Text, nullable=False)
+    is_required = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    version = relationship("ContentVersion", back_populates="sections")
+
+
+class ContentErratum(Base):
+    """紧急勘误：挂在已发布版本上，同段新勘误取代旧勘误，形成勘误链"""
+    __tablename__ = "content_erratas"
+
+    id = Column(Integer, primary_key=True, index=True)
+    theme_version_id = Column(Integer, ForeignKey("content_versions.id"), nullable=False)
+    erratum_no = Column(Integer, nullable=False)
+    section_id = Column(Integer, ForeignKey("content_sections.id"))
+    title = Column(String(200), nullable=False)
+    old_text = Column(Text)
+    new_text = Column(Text, nullable=False)
+    reason = Column(Text)
+    severity = Column(Enum(ErrataSeverity), nullable=False, default=ErrataSeverity.NORMAL)
+    status = Column(Enum(ErrataStatus), nullable=False, default=ErrataStatus.ACTIVE)
+    supersedes_id = Column(Integer, ForeignKey("content_erratas.id"))
+    issued_by = Column(String(100))
+    issued_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    version = relationship("ContentVersion", back_populates="erratas", foreign_keys=[theme_version_id])
+    section = relationship("ContentSection")
+    supersedes = relationship("ContentErratum", remote_side=[id], foreign_keys=[supersedes_id])
+    acks = relationship("SessionErrataAck", back_populates="erratum",
+                        cascade="all, delete-orphan")
+
+
+class SessionContentFreeze(Base):
+    """场次确认时冻结的可核验内容清单（快照+哈希），只追加不改写"""
+    __tablename__ = "session_content_freezes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("sessions.id"), nullable=False)
+    theme_id = Column(Integer, ForeignKey("themes.id"), nullable=False)
+    theme_version_id = Column(Integer, ForeignKey("content_versions.id"), nullable=False)
+    audience_age = Column(Integer)
+    is_current = Column(Boolean, nullable=False, default=True)
+    frozen_snapshot = Column(Text, nullable=False)
+    content_hash = Column(String(64), nullable=False)
+    schedule_state = Column(Enum(FreezeScheduleState), nullable=False,
+                            default=FreezeScheduleState.CONFIRMED)
+    school_confirmed = Column(Boolean, nullable=False, default=True)
+    confirmed_by = Column(String(100))
+    frozen_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # 新版本确认流程
+    target_version_id = Column(Integer, ForeignKey("content_versions.id"))
+    school_response = Column(Enum(SchoolResponse), default=SchoolResponse.PENDING)
+    responded_at = Column(DateTime(timezone=True))
+    response_note = Column(Text)
+
+    # 改期申请（审核通过前不改动场次时间）
+    pending_start_time = Column(DateTime(timezone=True))
+    pending_end_time = Column(DateTime(timezone=True))
+    reschedule_reason = Column(Text)
+    requested_by = Column(String(100))
+    reschedule_reviewed_by = Column(String(100))
+    reschedule_reviewed_at = Column(DateTime(timezone=True))
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    session = relationship("Session", foreign_keys=[session_id])
+    theme = relationship("Theme")
+    content_version = relationship("ContentVersion", foreign_keys=[theme_version_id],
+                                   back_populates="freezes")
+    target_version = relationship("ContentVersion", foreign_keys=[target_version_id])
+    erratum_acks = relationship("SessionErrataAck", back_populates="freeze",
+                                cascade="all, delete-orphan")
+
+
+class SessionErrataAck(Base):
+    """场次对某条勘误的回应记录：未开始场次可应用/拒绝，已结束场次不生成"""
+    __tablename__ = "session_errata_acks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    freeze_id = Column(Integer, ForeignKey("session_content_freezes.id"), nullable=False)
+    erratum_id = Column(Integer, ForeignKey("content_erratas.id"), nullable=False)
+    status = Column(Enum(ErrataAckStatus), nullable=False, default=ErrataAckStatus.PENDING)
+    decided_by = Column(String(100))
+    decided_at = Column(DateTime(timezone=True))
+    note = Column(Text)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    freeze = relationship("SessionContentFreeze", back_populates="erratum_acks")
+    erratum = relationship("ContentErratum", back_populates="acks")
+
+
+class StaffReplacement(Base):
+    """讲解员/讲师临时替换记录（只追加），不影响内容冻结证据"""
+    __tablename__ = "staff_replacements"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("sessions.id"), nullable=False)
+    old_staff_id = Column(Integer, ForeignKey("staff.id"), nullable=False)
+    new_staff_id = Column(Integer, ForeignKey("staff.id"), nullable=False)
+    old_assignment_id = Column(Integer)
+    role = Column(Enum(AssignmentRole), nullable=False)
+    reason = Column(Text)
+    operator = Column(String(100))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    session = relationship("Session", foreign_keys=[session_id])
+    old_staff = relationship("Staff", foreign_keys=[old_staff_id])
+    new_staff = relationship("Staff", foreign_keys=[new_staff_id])
