@@ -7,7 +7,8 @@ from app.models import (
     StaffType, SessionType, SessionStatus,
     AssignmentRole, AudienceType, WarningType,
     ChangeType, ChangeStatus, ConflictType, RescheduleStatus,
-    PointSourceType
+    PointSourceType, ContentVersionStatus, ErratumStatus,
+    ContentConfirmationStatus, SubstitutionStatus
 )
 
 
@@ -639,3 +640,243 @@ class StaffPointDetail(StaffRankingItem):
     is_excellent: bool
     positive_review_rate: float
     monthly_points: int = 0
+
+
+# ---------------------------------------------------------------------------
+# 主题内容版本化
+# ---------------------------------------------------------------------------
+
+class ContentSegmentInput(BaseModel):
+    """发布版本时提交的必讲段落清单项"""
+    segment_key: str
+    title: str
+    body: str
+    is_required: bool = True
+    sort_order: int = 0
+
+
+class ContentSegment(ContentSegmentInput):
+    id: int
+    content_hash: str
+
+    class Config:
+        from_attributes = True
+
+
+class ContentVersionCreate(BaseModel):
+    age_min: int = Field(ge=0, le=120)
+    age_max: int = Field(ge=0, le=120)
+    title: Optional[str] = None
+    content_text: str
+    required_segments: List[ContentSegmentInput] = []
+    sensitivity_notes: Optional[str] = None
+    effective_from: datetime
+    effective_to: Optional[datetime] = None
+    created_by: Optional[str] = None
+
+
+class ContentVersionUpdate(BaseModel):
+    """仅草稿版本可修改；已发布版本内容冻结，拒绝任何内容字段修改"""
+    age_min: Optional[int] = Field(None, ge=0, le=120)
+    age_max: Optional[int] = Field(None, ge=0, le=120)
+    title: Optional[str] = None
+    content_text: Optional[str] = None
+    required_segments: Optional[List[ContentSegmentInput]] = None
+    sensitivity_notes: Optional[str] = None
+    effective_from: Optional[datetime] = None
+    effective_to: Optional[datetime] = None
+
+
+class ContentVersion(BaseModel):
+    id: int
+    theme_id: int
+    version_number: int
+    status: ContentVersionStatus
+    title: Optional[str] = None
+    age_min: int
+    age_max: int
+    content_text: str
+    required_segments: List[ContentSegment] = []
+    sensitivity_notes: Optional[str] = None
+    effective_from: datetime
+    effective_to: Optional[datetime] = None
+    published_at: Optional[datetime] = None
+    withdrawn_at: Optional[datetime] = None
+    withdraw_reason: Optional[str] = None
+    created_by: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ContentVersionWithdraw(BaseModel):
+    reason: str
+    operator: str
+
+
+class ContentVersionWithdrawResult(ContentVersion):
+    affected_pending_sessions: int = 0
+
+
+class ErratumCreate(BaseModel):
+    target_item_id: Optional[int] = None
+    severity: str = "一般"
+    old_text: Optional[str] = None
+    new_text: str
+    reason: Optional[str] = None
+    issued_by: Optional[str] = None
+    supersedes_erratum_id: Optional[int] = None
+    # 是否要求引用该版本且未开始的场次重新确认
+    require_reconfirm: bool = True
+
+
+class Erratum(BaseModel):
+    id: int
+    content_version_id: int
+    erratum_no: int
+    target_item_id: Optional[int] = None
+    severity: str
+    old_text: Optional[str] = None
+    new_text: str
+    reason: Optional[str] = None
+    status: ErratumStatus
+    issued_by: Optional[str] = None
+    issued_at: datetime
+    supersedes_erratum_id: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ErratumChainView(Erratum):
+    """勘误链条目：勘误本体 + 本场次的送达/知悉情况 + 链条指向（扁平结构）"""
+    superseded_by_id: Optional[int] = None
+    delivered_at: Optional[datetime] = None
+    acknowledged_at: Optional[datetime] = None
+    acknowledged_by: Optional[str] = None
+    note: Optional[str] = None
+
+
+class ContentConfirmRequest(BaseModel):
+    confirmed_by: Optional[str] = None
+
+
+class ReconfirmRequest(BaseModel):
+    operator: str
+    # 指定重新确认所依据的内容版本；不传则使用主题当前生效版本
+    target_version_id: Optional[int] = None
+    reason: Optional[str] = None
+
+
+class SchoolRejectRequest(BaseModel):
+    rejected_by: str
+    reason: Optional[str] = None
+
+
+class ErratumAckRequest(BaseModel):
+    acknowledged_by: str
+    note: Optional[str] = None
+
+
+class FrozenChecklistItem(BaseModel):
+    item_id: int
+    segment_key: str
+    title: str
+    body: str
+    is_required: bool
+    content_hash: str
+    sort_order: int
+
+
+class ContentConfirmation(BaseModel):
+    id: int
+    session_id: int
+    content_version_id: int
+    version_number: int
+    status: ContentConfirmationStatus
+    frozen_age_min: int
+    frozen_age_max: int
+    content_hash: str
+    confirmed_by: Optional[str] = None
+    confirmed_at: datetime
+    reconfirm_reason: Optional[str] = None
+    school_response_at: Optional[datetime] = None
+    superseded_by_id: Optional[int] = None
+    checklist: List[FrozenChecklistItem] = []
+    errata_chain: List[ErratumChainView] = []
+
+    class Config:
+        from_attributes = True
+
+
+class SessionContentStatus(BaseModel):
+    """场次内容状态总览：当前绑定/冻结版本与后续勘误链"""
+    session_id: int
+    session_title: str
+    session_status: SessionStatus
+    theme_id: int
+    current_confirmation_id: Optional[int] = None
+    content_version_id: Optional[int] = None
+    version_number: Optional[int] = None
+    confirmation_status: Optional[ContentConfirmationStatus] = None
+    content_hash: Optional[str] = None
+    has_pending_errata: bool = False
+    pending_errata_count: int = 0
+    current_available_version_id: Optional[int] = None
+    current_available_version_number: Optional[int] = None
+    needs_reconfirm: bool = False
+    frozen: Optional[ContentConfirmation] = None
+
+
+class AvailableContentVersion(BaseModel):
+    """当前可用于新场次确认的内容版本"""
+    theme_id: int
+    theme_name: str
+    version_id: int
+    version_number: int
+    title: Optional[str] = None
+    age_min: int
+    age_max: int
+    effective_from: datetime
+    effective_to: Optional[datetime] = None
+    sensitivity_notes: Optional[str] = None
+    open_errata_count: int = 0
+    segment_count: int = 0
+
+
+class SubstitutionCreate(BaseModel):
+    assignment_id: int
+    substitute_staff_id: Optional[int] = None
+    reason: Optional[str] = None
+    requested_by: Optional[str] = None
+
+
+class SubstitutionArrive(BaseModel):
+    substitute_staff_id: int
+    operator: str
+
+
+class SubstitutionAction(BaseModel):
+    operator: str
+
+
+class GuideSubstitutionOut(BaseModel):
+    id: int
+    session_id: int
+    assignment_id: int
+    original_staff_id: int
+    original_staff_name: str
+    substitute_staff_id: Optional[int] = None
+    substitute_staff_name: Optional[str] = None
+    role: AssignmentRole
+    reason: Optional[str] = None
+    status: SubstitutionStatus
+    requested_by: Optional[str] = None
+    requested_at: datetime
+    substituted_at: Optional[datetime] = None
+    restored_at: Optional[datetime] = None
+    cancelled_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True

@@ -341,6 +341,11 @@ def update_session(db: Session, session_id: int,
             else:
                 validation_errors.append("人员配置不足，需重新核对排班")
 
+    # 场次改期：若冻结的内容版本在新时间不再生效，置为“待重新确认”
+    if time_changed:
+        if refresh_confirmation_after_reschedule(db, db_session):
+            validation_errors.append("改期后原内容版本不再覆盖新时间，场次内容需重新确认")
+
     db.commit()
     db.refresh(db_session)
     return db_session, validation_errors
@@ -891,6 +896,11 @@ def execute_change_request(db: Session, change_id: int, operator: str) -> schema
     ))
 
     remaining_conflicts = len([c for c in change.conflicts if c.status != RescheduleStatus.RESOLVED])
+
+    # 改期执行后，检查冻结内容版本是否仍覆盖新时间
+    if change.new_start_time or change.new_end_time:
+        if refresh_confirmation_after_reschedule(db, session):
+            errors.append("改期后原内容版本不再覆盖新时间，场次内容需重新确认")
 
     db.commit()
     db.refresh(change)
@@ -1645,3 +1655,794 @@ def adjust_staff_points(db: Session, staff_id: int, points: int,
         return add_points(db, staff_id, points, source_type, description=description)
     else:
         return add_points(db, staff_id, points, PointSourceType.DEDUCTION, description=description)
+
+
+# ---------------------------------------------------------------------------
+# 主题内容版本化：版本发布、场次冻结确认、紧急勘误链、版本撤回、讲解员替班
+# ---------------------------------------------------------------------------
+
+import hashlib
+import json as _json
+
+from app.models import (
+    ThemeContentVersion, ContentVersionItem, SessionContentConfirmation,
+    ContentErratum, ErratumAcknowledgement, GuideSubstitution,
+    ContentVersionStatus, ErratumStatus, ContentConfirmationStatus,
+    SubstitutionStatus,
+)
+
+
+def _naive(dt: Optional[datetime]) -> Optional[datetime]:
+    """统一去掉时区，避免 SQLite 中 naive/aware 时间比较报错。"""
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        return dt.astimezone().replace(tzinfo=None)
+    return dt
+
+
+def _segment_hash(segment_key: str, title: str, body: str) -> str:
+    payload = _json.dumps(
+        {"segment_key": segment_key, "title": title, "body": body},
+        ensure_ascii=False, sort_keys=True
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _build_checklist(items: List[ContentVersionItem]) -> Tuple[list, str, str]:
+    """由版本清单项构造冻结快照：结构化清单、规范化 JSON、整体校验值。"""
+    data = [
+        {
+            "item_id": item.id,
+            "segment_key": item.segment_key,
+            "title": item.title,
+            "body": item.body,
+            "is_required": item.is_required,
+            "content_hash": item.content_hash,
+            "sort_order": item.sort_order,
+        }
+        for item in sorted(items, key=lambda x: (x.sort_order, x.id))
+    ]
+    text = _json.dumps(data, ensure_ascii=False, sort_keys=True)
+    overall = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return data, text, overall
+
+
+def _load_checklist(frozen_json: str) -> list:
+    try:
+        return _json.loads(frozen_json)
+    except (ValueError, TypeError):
+        return []
+
+
+def get_content_version(db: Session, version_id: int) -> Optional[ThemeContentVersion]:
+    return db.query(ThemeContentVersion).options(
+        joinedload(ThemeContentVersion.items),
+        joinedload(ThemeContentVersion.theme),
+        joinedload(ThemeContentVersion.errata),
+    ).filter(ThemeContentVersion.id == version_id).first()
+
+
+def list_content_versions(db: Session, theme_id: int,
+                          status: Optional[ContentVersionStatus] = None) -> List[ThemeContentVersion]:
+    query = db.query(ThemeContentVersion).options(
+        joinedload(ThemeContentVersion.items)
+    ).filter(ThemeContentVersion.theme_id == theme_id)
+    if status:
+        query = query.filter(ThemeContentVersion.status == status)
+    return query.order_by(ThemeContentVersion.version_number.desc()).all()
+
+
+def _next_version_number(db: Session, theme_id: int) -> int:
+    last = db.query(func.max(ThemeContentVersion.version_number)).filter(
+        ThemeContentVersion.theme_id == theme_id
+    ).scalar()
+    return (last or 0) + 1
+
+
+def create_content_version(db: Session, theme_id: int,
+                           version_in: schemas.ContentVersionCreate
+                           ) -> Tuple[Optional[ThemeContentVersion], List[str]]:
+    theme = get_theme(db, theme_id)
+    if not theme:
+        return None, ["主题不存在"]
+    if version_in.age_min > version_in.age_max:
+        return None, ["适用年龄下限不能大于上限"]
+    if version_in.effective_to and _naive(version_in.effective_to) <= _naive(version_in.effective_from):
+        return None, ["生效结束时间必须晚于生效开始时间"]
+
+    version = ThemeContentVersion(
+        theme_id=theme_id,
+        version_number=_next_version_number(db, theme_id),
+        status=ContentVersionStatus.DRAFT,
+        title=version_in.title,
+        age_min=version_in.age_min,
+        age_max=version_in.age_max,
+        content_text=version_in.content_text,
+        required_segments="[]",
+        sensitivity_notes=version_in.sensitivity_notes,
+        effective_from=version_in.effective_from,
+        effective_to=version_in.effective_to,
+        created_by=version_in.created_by,
+    )
+    db.add(version)
+    db.flush()
+
+    keys = set()
+    for seg in version_in.required_segments:
+        if seg.segment_key in keys:
+            db.rollback()
+            return None, [f"段落标识重复：{seg.segment_key}"]
+        keys.add(seg.segment_key)
+        db.add(ContentVersionItem(
+            version_id=version.id,
+            segment_key=seg.segment_key,
+            title=seg.title,
+            body=seg.body,
+            is_required=seg.is_required,
+            content_hash=_segment_hash(seg.segment_key, seg.title, seg.body),
+            sort_order=seg.sort_order,
+        ))
+    version.required_segments = _json.dumps(sorted(keys), ensure_ascii=False)
+
+    db.commit()
+    db.refresh(version)
+    return get_content_version(db, version.id), []
+
+
+def update_content_version(db: Session, version_id: int,
+                           version_in: schemas.ContentVersionUpdate
+                           ) -> Tuple[Optional[ThemeContentVersion], List[str]]:
+    version = get_content_version(db, version_id)
+    if not version:
+        return None, ["内容版本不存在"]
+    if version.status != ContentVersionStatus.DRAFT:
+        return None, [f"版本当前为{version.status.value}状态，内容已冻结，不能修改；请发布新版本或提交勘误"]
+
+    data = version_in.model_dump(exclude_unset=True)
+    if "required_segments" in data:
+        segments = data.pop("required_segments")
+    else:
+        segments = None
+
+    for field, value in data.items():
+        setattr(version, field, value)
+
+    age_min = version.age_min
+    age_max = version.age_max
+    if age_min > age_max:
+        db.rollback()
+        return None, ["适用年龄下限不能大于上限"]
+    eff_from = _naive(version.effective_from)
+    eff_to = _naive(version.effective_to)
+    if eff_to and eff_to <= eff_from:
+        db.rollback()
+        return None, ["生效结束时间必须晚于生效开始时间"]
+
+    if segments is not None:
+        db.query(ContentVersionItem).filter(
+            ContentVersionItem.version_id == version_id
+        ).delete()
+        keys = set()
+        for seg in segments:
+            if seg["segment_key"] in keys:
+                db.rollback()
+                return None, [f"段落标识重复：{seg['segment_key']}"]
+            keys.add(seg["segment_key"])
+            db.add(ContentVersionItem(
+                version_id=version_id,
+                segment_key=seg["segment_key"],
+                title=seg["title"],
+                body=seg["body"],
+                is_required=seg["is_required"],
+                content_hash=_segment_hash(seg["segment_key"], seg["title"], seg["body"]),
+                sort_order=seg["sort_order"],
+            ))
+        version.required_segments = _json.dumps(sorted(keys), ensure_ascii=False)
+
+    db.commit()
+    return get_content_version(db, version_id), []
+
+
+def publish_content_version(db: Session, version_id: int
+                            ) -> Tuple[Optional[ThemeContentVersion], List[str]]:
+    version = get_content_version(db, version_id)
+    if not version:
+        return None, ["内容版本不存在"]
+    if version.status != ContentVersionStatus.DRAFT:
+        return None, [f"仅草稿版本可发布，当前为{version.status.value}状态"]
+    required = [i for i in version.items if i.is_required]
+    if not required:
+        return None, ["发布前至少需要一个必讲段落"]
+    if not version.content_text or not version.content_text.strip():
+        return None, ["讲解词正文不能为空"]
+
+    version.status = ContentVersionStatus.PUBLISHED
+    version.published_at = func.now()
+    db.commit()
+    return get_content_version(db, version_id), []
+
+
+def _version_covers(version: ThemeContentVersion, at: Optional[datetime] = None) -> bool:
+    """版本在指定时刻（默认现在）是否处于已发布且生效的区间内。"""
+    if version.status != ContentVersionStatus.PUBLISHED:
+        return False
+    moment = _naive(at) or datetime.now()
+    if _naive(version.effective_from) > moment:
+        return False
+    if version.effective_to and _naive(version.effective_to) < moment:
+        return False
+    return True
+
+
+def get_current_content_version(db: Session, theme_id: int,
+                                at: Optional[datetime] = None) -> Optional[ThemeContentVersion]:
+    """主题当前可用于新场次确认的内容版本（生效区间内、版本号最新）。"""
+    versions = db.query(ThemeContentVersion).options(
+        joinedload(ThemeContentVersion.items)
+    ).filter(ThemeContentVersion.theme_id == theme_id).all()
+    covering = [v for v in versions if _version_covers(v, at)]
+    if not covering:
+        return None
+    return max(covering, key=lambda v: v.version_number)
+
+
+def withdraw_content_version(db: Session, version_id: int, reason: str,
+                             operator: str) -> Tuple[Optional[ThemeContentVersion], int, List[str]]:
+    """撤回已发布版本。
+
+    引用该版本且尚未开始的场次进入“待重新确认”；已结束/已取消场次的
+    冻结证据不受影响。返回 (版本, 受影响待确认场次数, 错误)。
+    """
+    version = get_content_version(db, version_id)
+    if not version:
+        return None, 0, ["内容版本不存在"]
+    if version.status != ContentVersionStatus.PUBLISHED:
+        return None, 0, [f"仅已发布版本可撤回，当前为{version.status.value}状态"]
+
+    version.status = ContentVersionStatus.WITHDRAWN
+    version.withdrawn_at = func.now()
+    version.withdraw_reason = reason
+
+    affected = 0
+    confirmations = db.query(SessionContentConfirmation).options(
+        joinedload(SessionContentConfirmation.session)
+    ).filter(
+        SessionContentConfirmation.content_version_id == version_id,
+        SessionContentConfirmation.status.in_([
+            ContentConfirmationStatus.CONFIRMED,
+            ContentConfirmationStatus.PENDING_RECONFIRM,
+        ])
+    ).all()
+    now = datetime.now()
+    for conf in confirmations:
+        sess = conf.session
+        if sess and sess.status not in (SessionStatus.COMPLETED, SessionStatus.CANCELLED) \
+                and _naive(sess.start_time) > now:
+            if conf.status != ContentConfirmationStatus.PENDING_RECONFIRM:
+                conf.status = ContentConfirmationStatus.PENDING_RECONFIRM
+                conf.reconfirm_reason = f"内容版本 v{version.version_number} 已被馆方撤回（{operator}：{reason}）"
+                affected += 1
+
+    db.commit()
+    return get_content_version(db, version_id), affected, []
+
+
+# ---- 紧急勘误 ----
+
+def create_erratum(db: Session, version_id: int, erratum_in: schemas.ErratumCreate
+                   ) -> Tuple[Optional[ContentErratum], int, List[str]]:
+    """对已发布版本追加紧急勘误，并要求未开始场次重新确认。
+
+    勘误只追加、不改写原始版本与任何历史快照。返回 (勘误, 待重新确认场次数, 错误)。
+    """
+    version = get_content_version(db, version_id)
+    if not version:
+        return None, 0, ["内容版本不存在"]
+    if version.status not in (ContentVersionStatus.PUBLISHED, ContentVersionStatus.WITHDRAWN):
+        return None, 0, ["仅已发布（含已撤回留痕）的版本可追加勘误"]
+
+    if erratum_in.target_item_id is not None:
+        item = db.query(ContentVersionItem).filter(
+            ContentVersionItem.id == erratum_in.target_item_id,
+            ContentVersionItem.version_id == version_id
+        ).first()
+        if not item:
+            return None, 0, ["勘误目标段落不存在或不属于该版本"]
+
+    superseded = None
+    if erratum_in.supersedes_erratum_id is not None:
+        superseded = db.query(ContentErratum).filter(
+            ContentErratum.id == erratum_in.supersedes_erratum_id,
+            ContentErratum.content_version_id == version_id
+        ).first()
+        if not superseded:
+            return None, 0, ["被替代的勘误不存在或不属于该版本"]
+
+    last_no = db.query(func.max(ContentErratum.erratum_no)).filter(
+        ContentErratum.content_version_id == version_id
+    ).scalar()
+    erratum = ContentErratum(
+        content_version_id=version_id,
+        erratum_no=(last_no or 0) + 1,
+        target_item_id=erratum_in.target_item_id,
+        severity=erratum_in.severity,
+        old_text=erratum_in.old_text,
+        new_text=erratum_in.new_text,
+        reason=erratum_in.reason,
+        status=ErratumStatus.ISSUED,
+        issued_by=erratum_in.issued_by,
+        supersedes_erratum_id=erratum_in.supersedes_erratum_id,
+    )
+    db.add(erratum)
+    if superseded is not None:
+        superseded.status = ErratumStatus.SUPERSEDED
+    db.flush()
+
+    affected = 0
+    if erratum_in.require_reconfirm:
+        confirmations = db.query(SessionContentConfirmation).options(
+            joinedload(SessionContentConfirmation.session)
+        ).filter(
+            SessionContentConfirmation.content_version_id == version_id,
+            SessionContentConfirmation.status.in_([
+                ContentConfirmationStatus.CONFIRMED,
+                ContentConfirmationStatus.PENDING_RECONFIRM,
+            ])
+        ).all()
+        now = datetime.now()
+        for conf in confirmations:
+            sess = conf.session
+            if not sess or sess.status in (SessionStatus.COMPLETED, SessionStatus.CANCELLED):
+                continue
+            if _naive(sess.start_time) <= now:
+                continue
+            exists = db.query(ErratumAcknowledgement).filter(
+                ErratumAcknowledgement.erratum_id == erratum.id,
+                ErratumAcknowledgement.confirmation_id == conf.id
+            ).first()
+            if not exists:
+                db.add(ErratumAcknowledgement(
+                    erratum_id=erratum.id,
+                    confirmation_id=conf.id,
+                ))
+            if conf.status == ContentConfirmationStatus.CONFIRMED:
+                conf.status = ContentConfirmationStatus.PENDING_RECONFIRM
+                reason = f"紧急勘误 #{erratum.erratum_no}（{erratum.severity}）要求重新确认内容版本"
+                conf.reconfirm_reason = reason
+                affected += 1
+
+    db.commit()
+    db.refresh(erratum)
+    return erratum, affected, []
+
+
+def list_errata(db: Session, version_id: int,
+                status: Optional[ErratumStatus] = None) -> List[ContentErratum]:
+    query = db.query(ContentErratum).filter(ContentErratum.content_version_id == version_id)
+    if status:
+        query = query.filter(ContentErratum.status == status)
+    return query.order_by(ContentErratum.erratum_no).all()
+
+
+# ---- 场次内容确认（冻结证据） ----
+
+def get_session_confirmation(db: Session, session_id: int,
+                             only_active: bool = True
+                             ) -> Optional[SessionContentConfirmation]:
+    query = db.query(SessionContentConfirmation).options(
+        joinedload(SessionContentConfirmation.session),
+        joinedload(SessionContentConfirmation.version).joinedload(ThemeContentVersion.items),
+    ).filter(SessionContentConfirmation.session_id == session_id)
+    if only_active:
+        query = query.filter(SessionContentConfirmation.status !=
+                             ContentConfirmationStatus.SUPERSEDED)
+    return query.order_by(SessionContentConfirmation.id.desc()).first()
+
+
+def list_session_confirmations(db: Session, session_id: int) -> List[SessionContentConfirmation]:
+    return db.query(SessionContentConfirmation).options(
+        joinedload(SessionContentConfirmation.version)
+    ).filter(SessionContentConfirmation.session_id == session_id
+    ).order_by(SessionContentConfirmation.id.desc()).all()
+
+
+def _freeze_confirmation(db: Session, session: Session, version: ThemeContentVersion,
+                         confirmed_by: Optional[str], reason: Optional[str] = None
+                         ) -> SessionContentConfirmation:
+    _, checklist_json, overall_hash = _build_checklist(version.items)
+    conf = SessionContentConfirmation(
+        session_id=session.id,
+        content_version_id=version.id,
+        status=ContentConfirmationStatus.CONFIRMED,
+        frozen_age_min=version.age_min,
+        frozen_age_max=version.age_max,
+        frozen_checklist=checklist_json,
+        content_hash=overall_hash,
+        confirmed_by=confirmed_by,
+        reconfirm_reason=reason,
+    )
+    db.add(conf)
+    db.flush()
+    return conf
+
+
+def confirm_session_content(db: Session, session_id: int,
+                            confirmed_by: Optional[str] = None,
+                            version_id: Optional[int] = None
+                            ) -> Tuple[Optional[SessionContentConfirmation], List[str]]:
+    """学校确认内容：冻结一份可核验的内容清单。
+
+    已存在未终结的确认时必须走重新确认流程；已结束场次不允许再确认。
+    """
+    session = get_session(db, session_id)
+    if not session:
+        return None, ["场次不存在"]
+    if session.status == SessionStatus.COMPLETED:
+        return None, ["已结束场次不能再确认或变更内容，冻结证据已归档"]
+
+    existing = get_session_confirmation(db, session_id)
+    if existing:
+        return None, [f"场次已确认内容版本 v{existing.version.version_number}，"
+                      f"当前状态为{existing.status.value}，请走重新确认接口"]
+
+    if version_id is not None:
+        version = get_content_version(db, version_id)
+        if not version or version.theme_id != session.theme_id:
+            return None, ["指定的内容版本不存在或不属于该场次主题"]
+        if version.status != ContentVersionStatus.PUBLISHED:
+            return None, [f"内容版本当前为{version.status.value}状态，不能用于确认"]
+    else:
+        version = get_current_content_version(db, session.theme_id,
+                                              at=_naive(session.start_time))
+        if not version:
+            return None, ["该主题当前没有生效的内容版本，无法确认"]
+
+    conf = _freeze_confirmation(db, session, version, confirmed_by)
+    db.commit()
+    db.refresh(conf)
+    return get_session_confirmation(db, session_id, only_active=False), []
+
+
+def reconfirm_session_content(db: Session, session_id: int, operator: str,
+                              target_version_id: Optional[int] = None,
+                              reason: Optional[str] = None
+                              ) -> Tuple[Optional[SessionContentConfirmation], List[str]]:
+    """学校接受（重新确认）一个内容版本。
+
+    旧确认转为“已被新版本替代”并保留冻结证据；新确认冻结新版本清单。
+    已结束场次一律拒绝，确保历史证据不被改写。
+    """
+    session = get_session(db, session_id)
+    if not session:
+        return None, ["场次不存在"]
+    if session.status == SessionStatus.COMPLETED:
+        return None, ["已结束场次不能重新确认，历史冻结证据不可改写"]
+
+    old = get_session_confirmation(db, session_id)
+    if not old:
+        return None, ["场次尚无内容确认，请先调用确认接口"]
+
+    if target_version_id is not None:
+        new_version = get_content_version(db, target_version_id)
+        if not new_version or new_version.theme_id != session.theme_id:
+            return None, ["目标内容版本不存在或不属于该场次主题"]
+    else:
+        new_version = get_current_content_version(db, session.theme_id,
+                                                  at=_naive(session.start_time))
+    if not new_version:
+        return None, ["该主题当前没有可用的内容版本"]
+    if new_version.status != ContentVersionStatus.PUBLISHED:
+        return None, [f"目标版本当前为{new_version.status.value}状态，不能用于确认"]
+    if new_version.id == old.content_version_id and \
+            old.status == ContentConfirmationStatus.CONFIRMED:
+        return None, [f"场次已确认版本 v{new_version.version_number}，无需重新确认"]
+
+    new_conf = _freeze_confirmation(
+        db, session, new_version, operator,
+        reason or f"由版本 v{old.version.version_number} 重新确认至 v{new_version.version_number}"
+    )
+
+    old.status = ContentConfirmationStatus.SUPERSEDED
+    old.superseded_by_id = new_conf.id
+    old.school_response_at = func.now()
+    # 关闭旧确认上未处理的勘误送达，保证勘误链有确定结局
+    for ack in old.errata_acknowledgements:
+        if ack.acknowledged_at is None:
+            ack.acknowledged_at = func.now()
+            ack.acknowledged_by = operator
+            ack.note = f"已重新确认内容版本 v{new_version.version_number}"
+
+    db.commit()
+    return get_session_confirmation(db, session_id), []
+
+
+def reject_new_version(db: Session, session_id: int, rejected_by: str,
+                       reason: Optional[str] = None
+                       ) -> Tuple[Optional[SessionContentConfirmation], List[str]]:
+    """学校拒绝新版本：场次仍锁定在原冻结版本，状态转为“学校拒绝新版本”。"""
+    session = get_session(db, session_id)
+    if not session:
+        return None, ["场次不存在"]
+    if session.status == SessionStatus.COMPLETED:
+        return None, ["已结束场次的内容确认状态不能变更"]
+
+    conf = get_session_confirmation(db, session_id)
+    if not conf:
+        return None, ["场次尚无内容确认"]
+    if conf.status != ContentConfirmationStatus.PENDING_RECONFIRM:
+        return None, [f"仅“待重新确认”状态可拒绝新版本，当前为{conf.status.value}状态"]
+
+    conf.status = ContentConfirmationStatus.SCHOOL_REJECTED
+    conf.school_response_at = func.now()
+    conf.reconfirm_reason = (conf.reconfirm_reason or "") + \
+        f"；学校{rejected_by}拒绝重新确认" + (f"：{reason}" if reason else "")
+    db.commit()
+    db.refresh(conf)
+    return conf, []
+
+
+def retain_confirmed_version(db: Session, session_id: int, operator: str
+                             ) -> Tuple[Optional[SessionContentConfirmation], List[str]]:
+    """学校拒绝新版本后，馆方确认仍按原冻结版本执行，状态恢复“已确认”。"""
+    conf = get_session_confirmation(db, session_id)
+    if not conf:
+        return None, ["场次尚无内容确认"]
+    if conf.status != ContentConfirmationStatus.SCHOOL_REJECTED:
+        return None, [f"仅“学校拒绝新版本”状态可恢复确认，当前为{conf.status.value}状态"]
+    # 若锁定版本已撤回，则不能恢复，必须改确认其他版本
+    version = get_content_version(db, conf.content_version_id)
+    if not version or version.status != ContentVersionStatus.PUBLISHED:
+        return None, ["原冻结版本已撤回，不能继续沿用，请重新确认其他版本"]
+    conf.status = ContentConfirmationStatus.CONFIRMED
+    conf.reconfirm_reason = (conf.reconfirm_reason or "") + f"；{operator} 核定仍按原版本执行"
+    db.commit()
+    db.refresh(conf)
+    return conf, []
+
+
+def acknowledge_erratum(db: Session, session_id: int, erratum_id: int,
+                        acknowledged_by: str, note: Optional[str] = None
+                        ) -> Tuple[Optional[ErratumAcknowledgement], List[str]]:
+    """学校/馆方知悉某条勘误（仅记录知悉，不改写冻结证据）。"""
+    conf = get_session_confirmation(db, session_id)
+    if not conf:
+        return None, ["场次尚无内容确认"]
+    erratum = db.query(ContentErratum).filter(ContentErratum.id == erratum_id).first()
+    if not erratum or erratum.content_version_id != conf.content_version_id:
+        return None, ["勘误不存在或不属于该场次冻结的内容版本"]
+
+    ack = db.query(ErratumAcknowledgement).filter(
+        ErratumAcknowledgement.erratum_id == erratum_id,
+        ErratumAcknowledgement.confirmation_id == conf.id
+    ).first()
+    if not ack:
+        ack = ErratumAcknowledgement(
+            erratum_id=erratum_id,
+            confirmation_id=conf.id,
+        )
+        db.add(ack)
+    ack.acknowledged_at = func.now()
+    ack.acknowledged_by = acknowledged_by
+    ack.note = note
+    db.commit()
+    db.refresh(ack)
+    return ack, []
+
+
+def get_erratum_chain(db: Session, confirmation: SessionContentConfirmation) -> List[dict]:
+    """还原某次冻结确认实际被送达的勘误链及本场次的知悉情况。
+
+    只包含已送达该确认的勘误（版本上存在但未送达该场次的不计入，
+    尤其已结束场次在结束后新发的勘误不得附着为其证据的一部分）。
+    """
+    acks = {a.erratum_id: a for a in confirmation.errata_acknowledgements}
+    if not acks:
+        return []
+    errata = db.query(ContentErratum).filter(
+        ContentErratum.content_version_id == confirmation.content_version_id,
+        ContentErratum.id.in_(list(acks.keys()))
+    ).order_by(ContentErratum.erratum_no).all()
+    # 反向找出“被哪条勘误替代”（替代勘误本身可能未送达，仍需给出链条指向）
+    all_version_errata = db.query(ContentErratum).filter(
+        ContentErratum.content_version_id == confirmation.content_version_id
+    ).all()
+    superseded_by = {
+        e.supersedes_erratum_id: e.id
+        for e in all_version_errata if e.supersedes_erratum_id is not None
+    }
+    chain = []
+    for erratum in errata:
+        ack = acks.get(erratum.id)
+        chain.append({
+            "erratum": erratum,
+            "superseded_by_id": superseded_by.get(erratum.id),
+            "delivered_at": ack.delivered_at if ack else None,
+            "acknowledged_at": ack.acknowledged_at if ack else None,
+            "acknowledged_by": ack.acknowledged_by if ack else None,
+            "note": ack.note if ack else None,
+            "status": erratum.status.value,
+        })
+    return chain
+
+
+def verify_frozen_checklist(db: Session, confirmation_id: int) -> Tuple[bool, List[str]]:
+    """核验冻结快照是否被篡改：快照整体自证 + 逐条段落校验值。
+
+    快照在确认时独立固化，不依赖版本当前状态，因此历史版本被撤回、
+    被新版本替代都不影响该证据的自证。
+    """
+    conf = db.query(SessionContentConfirmation).filter(
+        SessionContentConfirmation.id == confirmation_id
+    ).first()
+    if not conf:
+        return False, ["确认记录不存在"]
+    frozen = _load_checklist(conf.frozen_checklist)
+    errors = []
+    # 快照整体自证：用快照内 JSON 重算校验值
+    self_text = _json.dumps(frozen, ensure_ascii=False, sort_keys=True)
+    self_hash = hashlib.sha256(self_text.encode("utf-8")).hexdigest()
+    if self_hash != conf.content_hash:
+        errors.append("冻结快照整体校验值不匹配，快照可能被篡改")
+    for entry in frozen:
+        if _segment_hash(entry["segment_key"], entry["title"], entry["body"]) != entry["content_hash"]:
+            errors.append(f"段落 {entry.get('segment_key')} 的逐条校验值不匹配")
+    return not errors, errors
+
+
+def refresh_confirmation_after_reschedule(db: Session, session: Session) -> bool:
+    """场次改期后校验冻结版本是否仍覆盖新时间，不覆盖则要求重新确认。
+
+    返回是否将场次置为“待重新确认”。
+    """
+    conf = get_session_confirmation(db, session.id)
+    if not conf or conf.status != ContentConfirmationStatus.CONFIRMED:
+        return False
+    if session.status in (SessionStatus.COMPLETED, SessionStatus.CANCELLED):
+        return False
+    version = get_content_version(db, conf.content_version_id)
+    new_start = _naive(session.start_time)
+    covers = bool(version) and version.status == ContentVersionStatus.PUBLISHED and \
+        _naive(version.effective_from) <= new_start and \
+        (version.effective_to is None or _naive(version.effective_to) >= new_start)
+    if not covers:
+        conf.status = ContentConfirmationStatus.PENDING_RECONFIRM
+        vno = version.version_number if version else conf.content_version_id
+        conf.reconfirm_reason = f"场次改期至 {new_start:%Y-%m-%d %H:%M}，原内容版本 v{vno} 不再覆盖该时间，需重新确认"
+        return True
+    return False
+
+
+# ---- 讲解员临时替换 ----
+
+def list_substitutions(db: Session, session_id: Optional[int] = None
+                       ) -> List[GuideSubstitution]:
+    query = db.query(GuideSubstitution).options(
+        joinedload(GuideSubstitution.original_staff),
+        joinedload(GuideSubstitution.substitute_staff),
+    )
+    if session_id is not None:
+        query = query.filter(GuideSubstitution.session_id == session_id)
+    return query.order_by(GuideSubstitution.requested_at.desc()).all()
+
+
+def get_substitution(db: Session, substitution_id: int) -> Optional[GuideSubstitution]:
+    return db.query(GuideSubstitution).options(
+        joinedload(GuideSubstitution.original_staff),
+        joinedload(GuideSubstitution.substitute_staff),
+        joinedload(GuideSubstitution.assignment),
+    ).filter(GuideSubstitution.id == substitution_id).first()
+
+
+def request_substitution(db: Session, session_id: int,
+                         sub_in: schemas.SubstitutionCreate
+                         ) -> Tuple[Optional[GuideSubstitution], List[str]]:
+    """登记讲解员临时替换需求（待替班）。不改动现有排班与内容冻结证据。"""
+    session = get_session(db, session_id)
+    if not session:
+        return None, ["场次不存在"]
+    if session.status in (SessionStatus.COMPLETED, SessionStatus.CANCELLED):
+        return None, [f"{session.status.value}场次不能登记替班"]
+
+    assignment = db.query(Assignment).filter(
+        Assignment.id == sub_in.assignment_id,
+        Assignment.session_id == session_id
+    ).first()
+    if not assignment:
+        return None, ["排班记录不存在或不属于该场次"]
+
+    active = db.query(GuideSubstitution).filter(
+        GuideSubstitution.assignment_id == assignment.id,
+        GuideSubstitution.status.in_([SubstitutionStatus.REQUESTED,
+                                      SubstitutionStatus.SUBSTITUTED])
+    ).first()
+    if active:
+        return None, [f"该排班已有进行中的替班记录（状态：{active.status.value}），请先闭环"]
+
+    sub = GuideSubstitution(
+        session_id=session_id,
+        assignment_id=assignment.id,
+        original_staff_id=assignment.staff_id,
+        substitute_staff_id=sub_in.substitute_staff_id,
+        role=assignment.role,
+        reason=sub_in.reason,
+        status=SubstitutionStatus.REQUESTED,
+        requested_by=sub_in.requested_by,
+    )
+    db.add(sub)
+    db.commit()
+    db.refresh(sub)
+    return get_substitution(db, sub.id), []
+
+
+def _assignment_to(db: Session, assignment: Assignment, staff_id: int) -> List[str]:
+    """把某条排班改派给另一名人员，返回资格/冲突错误。"""
+    session = assignment.session
+    qualified, errs = is_staff_qualified(db, staff_id, session.theme_id,
+                                         session.venue_id, assignment.role)
+    if not qualified:
+        return errs
+    if not is_staff_available(db, staff_id, session.start_time, session.end_time, session.id):
+        staff = get_staff(db, staff_id)
+        return [f"替班人员 {staff.name if staff else staff_id} 在该时间段已有安排"]
+    assignment.staff_id = staff_id
+    return []
+
+
+def substitution_arrive(db: Session, substitution_id: int, substitute_staff_id: int,
+                        operator: str) -> Tuple[Optional[GuideSubstitution], List[str]]:
+    """替班讲解员到岗：校验资格与时间后改派排班，状态置“替班已到岗”。"""
+    sub = get_substitution(db, substitution_id)
+    if not sub:
+        return None, ["替班记录不存在"]
+    if sub.status != SubstitutionStatus.REQUESTED:
+        return None, [f"仅待替班记录可报到岗，当前为{sub.status.value}状态"]
+    if substitute_staff_id == sub.original_staff_id:
+        return None, ["替班人员不能与原讲解员相同"]
+
+    errs = _assignment_to(db, sub.assignment, substitute_staff_id)
+    if errs:
+        return None, errs
+
+    sub.substitute_staff_id = substitute_staff_id
+    sub.status = SubstitutionStatus.SUBSTITUTED
+    sub.substituted_at = func.now()
+    sub.operator = operator
+    db.commit()
+    return get_substitution(db, substitution_id), []
+
+
+def substitution_restore(db: Session, substitution_id: int, operator: str
+                         ) -> Tuple[Optional[GuideSubstitution], List[str]]:
+    """原讲解员回归：排班改回原人员，状态置“原讲解员已回归”。"""
+    sub = get_substitution(db, substitution_id)
+    if not sub:
+        return None, ["替班记录不存在"]
+    if sub.status != SubstitutionStatus.SUBSTITUTED:
+        return None, [f"仅替班已到岗记录可回归，当前为{sub.status.value}状态"]
+
+    errs = _assignment_to(db, sub.assignment, sub.original_staff_id)
+    if errs:
+        return None, errs
+
+    sub.assignment.staff_id = sub.original_staff_id
+    sub.status = SubstitutionStatus.RESTORED
+    sub.restored_at = func.now()
+    sub.operator = operator
+    db.commit()
+    return get_substitution(db, substitution_id), []
+
+
+def substitution_cancel(db: Session, substitution_id: int, operator: str
+                        ) -> Tuple[Optional[GuideSubstitution], List[str]]:
+    """取消尚未到岗的替班需求。"""
+    sub = get_substitution(db, substitution_id)
+    if not sub:
+        return None, ["替班记录不存在"]
+    if sub.status != SubstitutionStatus.REQUESTED:
+        return None, [f"仅待替班记录可取消，当前为{sub.status.value}状态"]
+    sub.status = SubstitutionStatus.CANCELLED
+    sub.cancelled_at = func.now()
+    sub.operator = operator
+    db.commit()
+    return get_substitution(db, substitution_id), []
